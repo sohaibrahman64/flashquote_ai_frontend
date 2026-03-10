@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useAuth, useClerk } from "@clerk/clerk-react";
+import { useAuth, useClerk, useUser } from "@clerk/clerk-react";
 import { useNavigate } from "react-router-dom";
 import { jsPDF } from "jspdf";
 import { BASE_URL } from "./Constants";
@@ -211,6 +211,7 @@ function Sidebar({
   onLogout,
   isLoggingOut = false,
   planUsage,
+  userName = "User",
 }) {
   const usagePercent =
     planUsage.quotaLimit > 0
@@ -219,6 +220,7 @@ function Sidebar({
           Math.min(100, (planUsage.quotaUsed / planUsage.quotaLimit) * 100),
         )
       : 0;
+
 
   return (
     <aside className="flex h-full w-64 flex-col border-r border-slate-200 bg-white">
@@ -252,7 +254,7 @@ function Sidebar({
         </div>
 
         <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
-          <p className="m-0 text-sm font-semibold text-slate-900">John Freelancer</p>
+          <p className="m-0 text-sm font-semibold text-slate-900">{userName}</p>
           <p className="mt-0.5 text-xs text-slate-500">{planUsage.planCode} Plan</p>
           <p className="mt-3 text-xs text-slate-600">
             Usage this month: {planUsage.quotaUsed} / {planUsage.quotaLimit} quotes
@@ -1250,6 +1252,7 @@ function QuotePreviewModal({
 function Dashboard() {
   const { getToken } = useAuth();
   const { signOut } = useClerk();
+  const { user } = useUser();
   const navigate = useNavigate();
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
@@ -1278,9 +1281,13 @@ function Dashboard() {
   const [isQuotePreviewOpen, setIsQuotePreviewOpen] = useState(false);
   const [isDownloadingQuotePdf, setIsDownloadingQuotePdf] = useState(false);
   const [generatedQuoteDocument, setGeneratedQuoteDocument] = useState(null);
-  const [quotes, setQuotes] = useState(initialRecentQuotes);
-  const [clients, setClients] = useState(initialClients);
-  const [templates, setTemplates] = useState(templateCards);
+  const [quotes, setQuotes] = useState([]);
+  const [isLoadingQuotes, setIsLoadingQuotes] = useState(false);
+  const [quotesError, setQuotesError] = useState("");
+  const [manualClients, setManualClients] = useState([]);
+  const [templates, setTemplates] = useState([]);
+  const [isLoadingTemplates, setIsLoadingTemplates] = useState(false);
+  const [templatesError, setTemplatesError] = useState("");
   const startWithAiSectionRef = useRef(null);
   const quotesSectionRef = useRef(null);
   const clientsSectionRef = useRef(null);
@@ -1301,8 +1308,122 @@ function Dashboard() {
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [planUsage, setPlanUsage] = useState(() => getStoredSubscriptionUsage());
 
+  const fetchQuotes = async () => {
+    setIsLoadingQuotes(true);
+    setQuotesError("");
+    try {
+      const token = await getToken();
+      const response = await fetch(`${apiBaseUrl}/api/quotes`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to fetch quotes.");
+      }
+      const rawQuotes = Array.isArray(data) ? data : data?.quotes || data?.data || [];
+      const mapped = rawQuotes.map((q) => {
+        const inner = q.quote || {};
+        const displayId = inner.quote_id || q.quote_id || q.id || "-";
+        const clientName = inner.client_name || inner.clientName || "-";
+        const projectTitle = inner.project_title || inner.projectTitle || q.title || "-";
+        const totalAmount = q.total ?? inner.cost_summary?.grand_total ?? q.subtotal ?? "-";
+        const currency = q.currency || inner.currency || "USD";
+        const formattedAmount =
+          typeof totalAmount === "number"
+            ? new Intl.NumberFormat("en-US", { style: "currency", currency }).format(totalAmount)
+            : totalAmount;
+        const status = q.request_status || q.status || "Draft";
+        const statusLabel = status === "completed" ? "Completed" : status === "pending" ? "Pending" : status === "failed" ? "Failed" : status;
+        return {
+          id: displayId,
+          client: clientName,
+          projectTitle,
+          amount: formattedAmount,
+          status: statusLabel,
+          updated: q.created_at || q.updated_at || q.createdAt || q.updatedAt || "-",
+          raw: q,
+        };
+      });
+      setQuotes(mapped);
+    } catch (error) {
+      setQuotesError(error.message || "Failed to load quotes.");
+    } finally {
+      setIsLoadingQuotes(false);
+    }
+  };
+
+  const fetchTemplates = async () => {
+    setIsLoadingTemplates(true);
+    setTemplatesError("");
+    try {
+      const token = await getToken();
+      const response = await fetch(`${apiBaseUrl}/api/templates`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to fetch templates.");
+      }
+      const rawTemplates = Array.isArray(data) ? data : data?.templates || data?.data || [];
+      const mapped = rawTemplates.map((t) => ({
+        id: t.id || t.template_id || t._id || `TMP-${Math.random().toString(36).slice(2, 6)}`,
+        name: t.name || "Untitled Template",
+        category: t.category || "Web App",
+        budgetRange: t.budget_range || t.budgetRange || "-",
+        summary: t.summary || t.description || "",
+        modules: t.modules || 0,
+        preset: {
+          clientName: t.preset?.client_name || t.preset?.clientName || "",
+          projectTitle: t.preset?.project_title || t.preset?.projectTitle || t.name || "",
+          scopeSummary: t.preset?.scope_summary || t.preset?.scopeSummary || t.summary || "",
+          timeline: t.preset?.timeline || "",
+          budget: t.preset?.budget || t.budgetRange || t.budget_range || "",
+          pricingModel: t.preset?.pricing_model || t.preset?.pricingModel || "Fixed",
+          terms: t.preset?.terms || "",
+        },
+      }));
+      setTemplates(mapped);
+    } catch (error) {
+      setTemplatesError(error.message || "Failed to load templates.");
+    } finally {
+      setIsLoadingTemplates(false);
+    }
+  };
+
+  const clientsFromQuotes = (() => {
+    const countMap = {};
+    for (const q of quotes) {
+      const name = q.client;
+      if (!name || name === "-") continue;
+      countMap[name] = (countMap[name] || 0) + 1;
+    }
+    return Object.entries(countMap).map(([name, count]) => ({
+      id: `QC-${name}`,
+      name,
+      activeQuotes: count,
+    }));
+  })();
+
+  const clients = [
+    ...manualClients,
+    ...clientsFromQuotes.filter(
+      (qc) => !manualClients.some((mc) => mc.name.toLowerCase() === qc.name.toLowerCase()),
+    ),
+  ];
+
   useEffect(() => {
     setPlanUsage(getStoredSubscriptionUsage());
+    fetchQuotes();
+    fetchTemplates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const planUsagePercent =
@@ -1599,6 +1720,7 @@ function Dashboard() {
       setGeneratedQuoteDocument(normalizedQuote);
       setIsQuotePreviewOpen(true);
       setAiGenerationMessage("Quote generated successfully. Review and export to PDF.");
+      fetchQuotes();
     } catch (error) {
       setAiGenerationError(error.message || "Failed to generate quote draft.");
     } finally {
@@ -1936,34 +2058,51 @@ function Dashboard() {
     }
 
     setIsSavingTemplate(true);
-    await wait(700);
+    try {
+      const parsedModules = Number(templateForm.modules);
+      const fallbackBudget = "$1,000 - $2,000";
+      const fallbackTimeline = "4 weeks";
+      const fallbackSummary = "Custom template for quote generation.";
 
-    const parsedModules = Number(templateForm.modules);
-    const fallbackBudget = "$1,000 - $2,000";
-    const fallbackTimeline = "4 weeks";
-    const fallbackSummary = "Custom template for quote generation.";
+      const payload = {
+        name: templateForm.name.trim(),
+        category: templateForm.category,
+        budget_range: templateForm.budgetRange.trim() || fallbackBudget,
+        summary: templateForm.summary.trim() || fallbackSummary,
+        modules: Number.isFinite(parsedModules) && parsedModules > 0 ? parsedModules : 5,
+        preset: {
+          client_name: "",
+          project_title: templateForm.name.trim(),
+          scope_summary: templateForm.summary.trim() || fallbackSummary,
+          timeline: templateForm.timeline.trim() || fallbackTimeline,
+          budget: templateForm.budgetRange.trim() || fallbackBudget,
+          pricing_model: templateForm.pricingModel,
+          terms: templateForm.terms.trim() || "Payment terms to be discussed",
+        },
+      };
 
-    const newTemplate = {
-      id: `TMP-${Math.floor(1000 + Math.random() * 9000)}`,
-      name: templateForm.name.trim(),
-      category: templateForm.category,
-      budgetRange: templateForm.budgetRange.trim() || fallbackBudget,
-      summary: templateForm.summary.trim() || fallbackSummary,
-      modules: Number.isFinite(parsedModules) && parsedModules > 0 ? parsedModules : 5,
-      preset: {
-        clientName: "",
-        projectTitle: templateForm.name.trim(),
-        scopeSummary: templateForm.summary.trim() || fallbackSummary,
-        timeline: templateForm.timeline.trim() || fallbackTimeline,
-        budget: templateForm.budgetRange.trim() || fallbackBudget,
-        pricingModel: templateForm.pricingModel,
-        terms: templateForm.terms.trim() || "Payment terms to be discussed",
-      },
-    };
+      const token = await getToken();
+      const response = await fetch(`${apiBaseUrl}/api/templates`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
 
-    setTemplates((previous) => [newTemplate, ...previous]);
-    setIsSavingTemplate(false);
-    setIsCreateTemplateModalOpen(false);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.message || "Failed to save template.");
+      }
+
+      await fetchTemplates();
+      setIsCreateTemplateModalOpen(false);
+    } catch (error) {
+      setTemplatesError(error.message || "Failed to save template.");
+    } finally {
+      setIsSavingTemplate(false);
+    }
   };
 
   const handleSidebarNavigate = (item) => {
@@ -2056,34 +2195,26 @@ function Dashboard() {
         : 0,
     };
 
-    setClients((previous) => [newClient, ...previous]);
+    setManualClients((previous) => [newClient, ...previous]);
     setIsSavingClient(false);
     setIsAddClientModalOpen(false);
   };
 
   const handleCreateDraft = async () => {
     setIsCreatingQuote(true);
-    await wait(900);
 
-    const draftId = `Q-${Math.floor(1000 + Math.random() * 9000)}`;
     const draftAmount = createForm.budget || "$1,500";
-    const newDraft = {
-      id: draftId,
-      client: createForm.clientName || "New Client",
-      amount: draftAmount,
-      updated: "Just now",
-    };
-
-    setQuotes((previous) => [newDraft, ...previous]);
     setAiPrompt(
       `Project: ${createForm.projectTitle || "New project"}\nClient: ${createForm.clientName || "New Client"}\nScope: ${createForm.scopeSummary || "To be defined"}\nTimeline: ${createForm.timeline || "TBD"}\nBudget: ${draftAmount}`,
     );
+    setClientName(createForm.clientName || "");
+    setProjectType("");
 
     setIsCreatingQuote(false);
     setIsCreateModalOpen(false);
     setCreateStep(1);
     setCreateForm(buildInitialCreateForm(settingsForm.defaultPricingModel));
-    setCreateSuccessMessage("Quote created and added to Recent Quotes.");
+    setCreateSuccessMessage("Draft ready — click Generate Quote below to create it.");
 
     // After closing the wizard, guide users to the AI generation block.
     setTimeout(() => {
@@ -2165,6 +2296,30 @@ function Dashboard() {
                 className: "bg-slate-100 text-slate-600 border-slate-200",
               };
 
+  const handleViewQuote = (quote) => {
+    if (quote.raw) {
+      const normalizedQuote = normalizeGeneratedQuoteResponse(quote.raw);
+      setGeneratedQuoteDocument(normalizedQuote);
+      setIsQuotePreviewOpen(true);
+    }
+  };
+
+  const formatQuoteUpdated = (dateStr) => {
+    if (!dateStr || dateStr === "-") return dateStr;
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return dateStr;
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) return `${diffHours}h ago`;
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays < 30) return `${diffDays}d ago`;
+    return date.toLocaleDateString();
+  };
+
   const normalizedQuoteSearch = quoteSearchQuery.trim().toLowerCase();
   const filteredQuotes = normalizedQuoteSearch
     ? quotes.filter((quote) => {
@@ -2172,6 +2327,7 @@ function Dashboard() {
           quote.id,
           quote.client,
           quote.amount,
+          quote.status,
           quote.updated,
         ]
           .join(" ")
@@ -2191,6 +2347,7 @@ function Dashboard() {
             onLogout={handleLogout}
             isLoggingOut={isLoggingOut}
             planUsage={planUsage}
+            userName={user?.fullName || "User"}
           />
         </div>
 
@@ -2208,6 +2365,7 @@ function Dashboard() {
                 onLogout={handleLogout}
                 isLoggingOut={isLoggingOut}
                 planUsage={planUsage}
+                userName={user?.fullName || "User"}
               />
             </div>
           </div>
@@ -2229,7 +2387,7 @@ function Dashboard() {
                     Dashboard
                   </h1>
                   <p className="mt-0.5 text-sm text-slate-500">
-                    Welcome back, John.
+                    Welcome back, {user?.firstName || "there"}.
                   </p>
                 </div>
               </div>
@@ -2371,7 +2529,14 @@ function Dashboard() {
                 </p>
               </div>
 
-              {myQuotes.length > 0 ? (
+              {isLoadingQuotes ? (
+                <p className="text-sm text-slate-500">Loading quotes...</p>
+              ) : quotesError ? (
+                <div className="flex items-center gap-2">
+                  <p className="text-sm text-red-600">{quotesError}</p>
+                  <button type="button" onClick={fetchQuotes} className="text-sm font-medium text-blue-600 hover:underline">Retry</button>
+                </div>
+              ) : myQuotes.length > 0 ? (
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
                   {myQuotes.map((quote) => (
                     <article
@@ -2381,9 +2546,10 @@ function Dashboard() {
                       <p className="m-0 text-sm font-semibold text-slate-900">{quote.id}</p>
                       <p className="m-0 truncate text-sm text-slate-700">{quote.client}</p>
                       <p className="mt-1 text-base font-semibold text-slate-900">{quote.amount}</p>
-                      <p className="mt-1 text-xs text-slate-500">Updated {quote.updated}</p>
+                      <p className="mt-1 text-xs text-slate-500">Updated {formatQuoteUpdated(quote.updated)}</p>
                       <button
                         type="button"
+                        onClick={() => handleViewQuote(quote)}
                         className="mt-3 w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700"
                       >
                         View Quote
@@ -2437,10 +2603,11 @@ function Dashboard() {
                           <td className="py-3 pr-3 font-medium text-slate-800">{quote.id}</td>
                           <td className="py-3 pr-3 text-slate-700">{quote.client}</td>
                           <td className="py-3 pr-3 text-slate-700">{quote.amount}</td>
-                          <td className="py-3 pr-3 text-slate-700">{quote.updated}</td>
+                          <td className="py-3 pr-3 text-slate-700">{formatQuoteUpdated(quote.updated)}</td>
                           <td className="py-3">
                             <button
                               type="button"
+                              onClick={() => handleViewQuote(quote)}
                               className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700"
                             >
                               View
@@ -2460,11 +2627,15 @@ function Dashboard() {
               <div className="space-y-3 md:hidden">
                 {filteredQuotes.length > 0 ? (
                   filteredQuotes.map((quote) => (
-                    <article key={quote.id} className="rounded-xl border border-slate-200 p-4">
+                    <article
+                      key={quote.id}
+                      className="cursor-pointer rounded-xl border border-slate-200 p-4"
+                      onClick={() => handleViewQuote(quote)}
+                    >
                       <p className="m-0 text-sm font-semibold text-slate-900">{quote.id}</p>
                       <p className="mt-1 text-sm text-slate-700">{quote.client}</p>
                       <p className="mt-1 text-sm text-slate-600">{quote.amount}</p>
-                      <p className="mt-1 text-xs text-slate-500">Updated {quote.updated}</p>
+                      <p className="mt-1 text-xs text-slate-500">Updated {formatQuoteUpdated(quote.updated)}</p>
                     </article>
                   ))
                 ) : (
@@ -2477,26 +2648,25 @@ function Dashboard() {
               ref={clientsSectionRef}
               className="rounded-2xl border border-slate-200 bg-white p-5"
             >
-              <div className="mb-4 flex items-center justify-between gap-3">
+              <div className="mb-4">
                 <h2 className="m-0 text-lg font-semibold text-slate-900">Clients</h2>
-                <button
-                  type="button"
-                  onClick={openAddClientModal}
-                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700"
-                >
-                  + Add Client
-                </button>
               </div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {clients.map((client) => (
-                  <article key={client.id} className="rounded-xl border border-slate-200 p-4">
-                    <p className="m-0 text-sm font-semibold text-slate-900">{client.name}</p>
-                    <p className="mt-1 text-xs text-slate-500">
-                      {client.activeQuotes} active quote{client.activeQuotes === 1 ? "" : "s"}
-                    </p>
-                  </article>
-                ))}
-              </div>
+              {isLoadingQuotes && clients.length === 0 ? (
+                <p className="text-sm text-slate-500">Loading clients...</p>
+              ) : clients.length === 0 ? (
+                <p className="text-sm text-slate-500">No clients yet. Generate a quote to see clients here.</p>
+              ) : (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {clients.map((client) => (
+                    <article key={client.id} className="rounded-xl border border-slate-200 p-4">
+                      <p className="m-0 text-sm font-semibold text-slate-900">{client.name}</p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {client.activeQuotes} quote{client.activeQuotes === 1 ? "" : "s"}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              )}
             </section>
 
             <section
@@ -2519,35 +2689,52 @@ function Dashboard() {
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {templates.map((template) => (
-                  <article key={template.id} className="rounded-xl border border-slate-200 p-4">
-                    <p className="m-0 text-sm font-semibold text-slate-900">{template.name}</p>
-                    <p className="mt-1 text-xs text-slate-500">
-                      {template.category} • {template.budgetRange}
-                    </p>
-                    <p className="mt-3 text-sm text-slate-700">{template.summary}</p>
-                    <p className="mt-2 text-xs text-slate-500">{template.modules} modules</p>
+              {isLoadingTemplates && templates.length === 0 ? (
+                <p className="text-sm text-slate-500">Loading templates...</p>
+              ) : templatesError && templates.length === 0 ? (
+                <div className="rounded-xl border border-red-200 bg-red-50 p-4">
+                  <p className="m-0 text-sm text-red-600">{templatesError}</p>
+                  <button
+                    type="button"
+                    onClick={fetchTemplates}
+                    className="mt-2 rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-700"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : templates.length === 0 ? (
+                <p className="text-sm text-slate-500">No templates yet.</p>
+              ) : (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                  {templates.map((template) => (
+                    <article key={template.id} className="rounded-xl border border-slate-200 p-4">
+                      <p className="m-0 text-sm font-semibold text-slate-900">{template.name}</p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {template.category} • {template.budgetRange}
+                      </p>
+                      <p className="mt-3 text-sm text-slate-700">{template.summary}</p>
+                      <p className="mt-2 text-xs text-slate-500">{template.modules} modules</p>
 
-                    <div className="mt-4 flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => handleUseTemplate(template)}
-                        className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white"
-                      >
-                        Use Template
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => openTemplatePreview(template)}
-                        className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium text-slate-700"
-                      >
-                        Preview
-                      </button>
-                    </div>
-                  </article>
-                ))}
-              </div>
+                      <div className="mt-4 flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleUseTemplate(template)}
+                          className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white"
+                        >
+                          Use Template
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openTemplatePreview(template)}
+                          className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium text-slate-700"
+                        >
+                          Preview
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
             </section>
 
             <section
