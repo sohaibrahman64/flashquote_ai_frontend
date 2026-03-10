@@ -45,6 +45,8 @@ const planPricing = {
 const apiBaseUrl = `${BASE_URL}`;
 const syncedUserSessions = new Set();
 const processedSubscriptionRequests = new Set();
+const SYNC_STORAGE_KEY = "session_token";
+const SUBSCRIPTION_STORAGE_KEY = "subscription_snapshot";
 
 function createIdempotencyKey() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -66,156 +68,232 @@ function storePendingFreeSubscription(source = "landing_page_try_for_free") {
   return payload;
 }
 
-function UserSyncPanel() {
-  const { getToken, sessionId, userId } = useAuth();
-  const { user } = useUser();
-  const [syncStatus, setSyncStatus] = useState("idle");
-  const [syncResponse, setSyncResponse] = useState(null);
-  const [syncError, setSyncError] = useState("");
+function getPendingFreeSubscription(source = "landing_page_try_for_free") {
+  const rawPending = sessionStorage.getItem("pending_free_subscription");
+  const fallback = {
+    plan_code: "FREE",
+    idempotency_key: createIdempotencyKey(),
+    source,
+    client_timestamp: new Date().toISOString(),
+  };
 
-  useEffect(() => {
-    const syncUser = async () => {
-      if (!user || !userId || !sessionId) {
-        return;
-      }
+  if (!rawPending) {
+    sessionStorage.setItem("pending_free_subscription", JSON.stringify(fallback));
+    return fallback;
+  }
 
-      const syncKey = `${userId}:${sessionId}`;
-
-      if (syncedUserSessions.has(syncKey)) {
-        setSyncStatus("success");
-        setSyncResponse((previous) =>
-          previous || {
-            status: 200,
-            data: { message: "User already synced for this session." },
-          },
-        );
-        return;
-      }
-
-      syncedUserSessions.add(syncKey);
-
-      setSyncStatus("loading");
-      setSyncError("");
-
-      try {
-        const token = await getToken();
-        const payload = {
-          auth: {
-            userId,
-            sessionId,
-          },
-          user: user
-            ? {
-                id: user.id,
-                username: user.username,
-                firstName: user.firstName,
-                lastName: user.lastName,
-                fullName: user.fullName,
-                primaryEmailAddress: user.primaryEmailAddress?.emailAddress,
-                imageUrl: user.imageUrl,
-                createdAt: user.createdAt,
-                updatedAt: user.updatedAt,
-              }
-            : null,
-        };
-
-        const response = await fetch(`${apiBaseUrl}/api/users/login`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          body: JSON.stringify(payload),
-        });
-
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-          throw new Error(data.message || "Failed to sync user.");
-        }
-
-        if (data?.session_token) {
-          localStorage.setItem("session_token", data.session_token);
-        }
-
-        setSyncResponse({
-          status: response.status,
-          data,
-        });
-        setSyncStatus("success");
-      } catch (error) {
-        syncedUserSessions.delete(syncKey);
-        setSyncError(error.message || "User sync failed.");
-        setSyncStatus("error");
-      }
+  try {
+    const parsed = JSON.parse(rawPending);
+    const normalized = {
+      plan_code: "FREE",
+      idempotency_key: parsed?.idempotency_key || createIdempotencyKey(),
+      source: parsed?.source || source,
+      client_timestamp: parsed?.client_timestamp || new Date().toISOString(),
     };
 
-    syncUser();
-  }, [getToken, sessionId, user, userId]);
+    sessionStorage.setItem("pending_free_subscription", JSON.stringify(normalized));
+    return normalized;
+  } catch {
+    sessionStorage.setItem("pending_free_subscription", JSON.stringify(fallback));
+    return fallback;
+  }
+}
 
-  const clerkSnapshot = {
+async function activateFreeSubscription({
+  getToken,
+  bearerToken,
+  source = "landing_page_try_for_free",
+}) {
+  const pending = getPendingFreeSubscription(source);
+  const idempotencyKey = pending.idempotency_key;
+
+  if (processedSubscriptionRequests.has(idempotencyKey)) {
+    return {
+      status: "skipped",
+      reason: "already_processed_in_session",
+      idempotencyKey,
+    };
+  }
+
+  processedSubscriptionRequests.add(idempotencyKey);
+
+  try {
+    const jwt = bearerToken || (await getToken?.());
+
+    if (!jwt) {
+      throw new Error("Missing auth token for subscription request.");
+    }
+
+    const response = await fetch(`${apiBaseUrl}/api/subscriptions/subscribe`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({
+        plan_code: "FREE",
+        idempotency_key: idempotencyKey,
+        source: pending.source,
+        client_timestamp: pending.client_timestamp,
+      }),
+    });
+
+    const responseData = await response.json().catch(() => ({}));
+
+    if (!response.ok && response.status !== 409) {
+      throw new Error(
+        responseData.message || "Failed to activate free subscription.",
+      );
+    }
+
+    if (responseData && typeof responseData === "object") {
+      localStorage.setItem(
+        SUBSCRIPTION_STORAGE_KEY,
+        JSON.stringify(responseData),
+      );
+    }
+
+    sessionStorage.removeItem("pending_free_subscription");
+    return {
+      status: response.status === 409 ? "already_active" : "success",
+      data: responseData,
+      idempotencyKey,
+    };
+  } catch (requestError) {
+    processedSubscriptionRequests.delete(idempotencyKey);
+    throw requestError;
+  }
+}
+
+async function syncUserSession({ getToken, userId, sessionId, user }) {
+  if (!user || !userId || !sessionId) {
+    throw new Error("Missing Clerk auth context for user sync.");
+  }
+
+  const syncKey = `${userId}:${sessionId}`;
+  const token = await getToken();
+
+  if (!token) {
+    throw new Error("Missing auth token for user sync.");
+  }
+
+  if (syncedUserSessions.has(syncKey)) {
+    return {
+      alreadySynced: true,
+      token,
+      data: { message: "User already synced for this session." },
+    };
+  }
+
+  syncedUserSessions.add(syncKey);
+
+  const payload = {
     auth: {
       userId,
       sessionId,
     },
-    user: user
-      ? {
-          id: user.id,
-          username: user.username,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          fullName: user.fullName,
-          primaryEmailAddress: user.primaryEmailAddress?.emailAddress,
-          imageUrl: user.imageUrl,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        }
-      : null,
+    user: {
+      id: user.id,
+      username: user.username,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      fullName: user.fullName,
+      primaryEmailAddress: user.primaryEmailAddress?.emailAddress,
+      imageUrl: user.imageUrl,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    },
   };
 
+  try {
+    const response = await fetch(`${apiBaseUrl}/api/users/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(data.message || "Failed to sync user.");
+    }
+
+    if (data?.session_token) {
+      localStorage.setItem(SYNC_STORAGE_KEY, data.session_token);
+    }
+
+    return {
+      alreadySynced: false,
+      token,
+      data,
+      status: response.status,
+    };
+  } catch (error) {
+    syncedUserSessions.delete(syncKey);
+    throw error;
+  }
+}
+
+function AuthCallbackPage() {
+  const { getToken, sessionId, userId } = useAuth();
+  const { user } = useUser();
+  const navigate = useNavigate();
+  const [status, setStatus] = useState("loading");
+  const [errorMessage, setErrorMessage] = useState("");
+
+  useEffect(() => {
+    const runPostLoginFlow = async () => {
+      if (!user || !userId || !sessionId) {
+        return;
+      }
+
+      setStatus("loading");
+      setErrorMessage("");
+
+      try {
+        const syncResult = await syncUserSession({
+          getToken,
+          sessionId,
+          userId,
+          user,
+        });
+
+        await activateFreeSubscription({
+          getToken,
+          bearerToken: syncResult.token,
+          source: "auto_login_post_sync",
+        });
+
+        setStatus("success");
+        navigate("/dashboard", { replace: true });
+      } catch (error) {
+        setStatus("error");
+        setErrorMessage(error.message || "Failed to complete login setup.");
+      }
+    };
+
+    runPostLoginFlow();
+  }, [getToken, navigate, sessionId, user, userId]);
+
   return (
-    <section className="mt-8 rounded-2xl border border-blue-200 bg-blue-50/60 p-5">
-      <h3 className="m-0 text-lg font-semibold text-blue-900">
-        Auth + User Sync Debug
-      </h3>
-      <p className="mb-3 mt-2 text-sm text-blue-800">
-        First protected API call to sync local user:{" "}
-        <span className="font-semibold">POST /api/users/login</span>
-      </p>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="rounded-lg border border-blue-200 bg-white p-3">
-          <p className="mb-2 mt-0 text-sm font-semibold text-gray-700">
-            Clerk Snapshot
+    <PageLayout>
+      <main className="mx-auto max-w-3xl px-6 py-14">
+        <h2 className="mb-2 text-3xl font-semibold">Setting Up Your Account</h2>
+        {status === "loading" ? (
+          <p className="text-gray-600">
+            Completing login and activating your free plan...
           </p>
-          <pre className="max-h-64 overflow-auto rounded bg-slate-900 p-3 text-xs text-slate-100">
-            {JSON.stringify(clerkSnapshot, null, 2)}
-          </pre>
-        </div>
-
-        <div className="rounded-lg border border-blue-200 bg-white p-3">
-          <p className="mb-2 mt-0 text-sm font-semibold text-gray-700">
-            Backend Sync Response
-          </p>
-          {syncStatus === "loading" ? (
-            <p className="m-0 text-sm text-gray-600">Syncing user...</p>
-          ) : null}
-          {syncStatus === "error" ? (
-            <p className="m-0 text-sm text-red-600">{syncError}</p>
-          ) : null}
-          {syncStatus === "success" ? (
-            <pre className="max-h-64 overflow-auto rounded bg-slate-900 p-3 text-xs text-slate-100">
-              {JSON.stringify(syncResponse, null, 2)}
-            </pre>
-          ) : null}
-          {syncStatus === "idle" ? (
-            <p className="m-0 text-sm text-gray-600">
-              Waiting for auth state...
-            </p>
-          ) : null}
-        </div>
-      </div>
-    </section>
+        ) : null}
+        {status === "error" ? <p className="text-red-600">{errorMessage}</p> : null}
+        {status === "success" ? (
+          <p className="text-green-600">Setup complete. Redirecting to dashboard...</p>
+        ) : null}
+      </main>
+    </PageLayout>
   );
 }
 
@@ -338,10 +416,6 @@ function HomePage() {
               </button>
             </SignedIn>
           </div>
-
-          <SignedIn>
-            <UserSyncPanel />
-          </SignedIn>
         </div>
 
         <section className="mt-16" id="about-us">
@@ -677,80 +751,40 @@ function CheckoutPage() {
 }
 
 function ActivateFreePageContent() {
-  const { getToken } = useAuth();
+  const { getToken, sessionId, userId } = useAuth();
+  const { user } = useUser();
   const navigate = useNavigate();
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
 
   useEffect(() => {
     const activate = async () => {
-      const rawPending = sessionStorage.getItem("pending_free_subscription");
-      const pending = rawPending
-        ? JSON.parse(rawPending)
-        : {
-            plan_code: "FREE",
-            idempotency_key: createIdempotencyKey(),
-            source: "landing_page_try_for_free",
-            client_timestamp: new Date().toISOString(),
-          };
-
-      const idempotencyKey = pending.idempotency_key || createIdempotencyKey();
-      pending.idempotency_key = idempotencyKey;
-      pending.plan_code = "FREE";
-      pending.source = pending.source || "landing_page_try_for_free";
-      pending.client_timestamp = pending.client_timestamp || new Date().toISOString();
-      sessionStorage.setItem("pending_free_subscription", JSON.stringify(pending));
-
-      if (processedSubscriptionRequests.has(idempotencyKey)) {
-        navigate("/dashboard", { replace: true });
-        return;
-      }
-
-      processedSubscriptionRequests.add(idempotencyKey);
       setStatus("loading");
       setError("");
 
       try {
-        const jwt = await getToken();
-        const bearerToken = jwt;
-
-        if (!bearerToken) {
-          throw new Error("Missing auth token for subscription request.");
-        }
-
-        const response = await fetch(`${apiBaseUrl}/api/subscriptions/subscribe`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${bearerToken}`,
-            "Content-Type": "application/json",
-            "Idempotency-Key": idempotencyKey,
-          },
-          body: JSON.stringify({
-            plan_code: "FREE",
-            idempotency_key: idempotencyKey,
-            source: pending.source,
-            client_timestamp: pending.client_timestamp,
-          }),
+        const syncResult = await syncUserSession({
+          getToken,
+          sessionId,
+          userId,
+          user,
         });
 
-        const responseData = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-          throw new Error(responseData.message || "Failed to activate free subscription.");
-        }
-
-        sessionStorage.removeItem("pending_free_subscription");
+        await activateFreeSubscription({
+          getToken,
+          bearerToken: syncResult.token,
+          source: "landing_page_try_for_free",
+        });
         setStatus("success");
         navigate("/dashboard", { replace: true });
       } catch (requestError) {
-        processedSubscriptionRequests.delete(idempotencyKey);
         setStatus("error");
         setError(requestError.message || "Failed to activate free subscription.");
       }
     };
 
     activate();
-  }, [getToken, navigate]);
+  }, [getToken, navigate, sessionId, user, userId]);
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-14">
@@ -778,7 +812,7 @@ function ActivateFreePage() {
 function HomeRoute() {
   const hasSessionToken =
     typeof window !== "undefined" &&
-    Boolean(localStorage.getItem("session_token"));
+    Boolean(localStorage.getItem(SYNC_STORAGE_KEY));
 
   if (hasSessionToken) {
     return <Navigate to="/dashboard" replace />;
@@ -792,6 +826,7 @@ function App() {
     <Routes>
       <Route path="/" element={<HomeRoute />} />
       <Route path="/dashboard" element={<Dashboard />} />
+      <Route path="/auth-callback" element={<AuthCallbackPage />} />
       <Route path="/activate-free" element={<ActivateFreePage />} />
       <Route path="/pricing" element={<Navigate to="/#pricing" replace />} />
       <Route path="/checkout" element={<CheckoutPage />} />
@@ -804,7 +839,7 @@ function App() {
                 routing="path"
                 path="/sign-in"
                 signUpUrl="/sign-up"
-                fallbackRedirectUrl="/dashboard"
+                fallbackRedirectUrl="/auth-callback"
               />
             </main>
           </PageLayout>
@@ -819,7 +854,7 @@ function App() {
                 routing="path"
                 path="/sign-up"
                 signInUrl="/sign-in"
-                fallbackRedirectUrl="/dashboard"
+                fallbackRedirectUrl="/auth-callback"
               />
             </main>
           </PageLayout>

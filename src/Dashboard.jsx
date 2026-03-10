@@ -1,5 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useAuth, useClerk } from "@clerk/clerk-react";
 import { useNavigate } from "react-router-dom";
+import { jsPDF } from "jspdf";
+import { BASE_URL } from "./Constants";
 
 const primaryNav = [
   "Dashboard",
@@ -10,6 +13,49 @@ const primaryNav = [
 ];
 
 const secondaryNav = ["Billing", "Settings", "Help"];
+const apiBaseUrl = `${BASE_URL}`;
+const SUBSCRIPTION_STORAGE_KEY = "subscription_snapshot";
+
+function getStoredSubscriptionUsage() {
+  const fallback = {
+    planCode: "FREE",
+    quotaLimit: 5,
+    quotaUsed: 3,
+    quotaRemaining: 2,
+  };
+
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+
+  try {
+    const raw = localStorage.getItem(SUBSCRIPTION_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+
+    const parsed = JSON.parse(raw);
+    const quotaSource = parsed?.quota && typeof parsed.quota === "object" ? parsed.quota : parsed;
+    const quotaLimit = Number(quotaSource?.quota_limit);
+    const quotaUsed = Number(quotaSource?.quota_used);
+    const quotaRemaining = Number(quotaSource?.quota_remaining);
+
+    const normalizedLimit = Number.isFinite(quotaLimit) && quotaLimit >= 0 ? quotaLimit : fallback.quotaLimit;
+    const normalizedUsed = Number.isFinite(quotaUsed) && quotaUsed >= 0 ? quotaUsed : fallback.quotaUsed;
+    const normalizedRemaining = Number.isFinite(quotaRemaining) && quotaRemaining >= 0
+      ? quotaRemaining
+      : Math.max(normalizedLimit - normalizedUsed, 0);
+
+    return {
+      planCode: String(parsed?.plan_code || fallback.planCode),
+      quotaLimit: normalizedLimit,
+      quotaUsed: normalizedUsed,
+      quotaRemaining: normalizedRemaining,
+    };
+  } catch {
+    return fallback;
+  }
+}
 
 const kpiCards = [
   { label: "Quotes this month", value: "12" },
@@ -160,7 +206,20 @@ function NavItem({ label, active = false, onClick }) {
   );
 }
 
-function Sidebar({ onNavigate }) {
+function Sidebar({
+  onNavigate,
+  onLogout,
+  isLoggingOut = false,
+  planUsage,
+}) {
+  const usagePercent =
+    planUsage.quotaLimit > 0
+      ? Math.max(
+          0,
+          Math.min(100, (planUsage.quotaUsed / planUsage.quotaLimit) * 100),
+        )
+      : 0;
+
   return (
     <aside className="flex h-full w-64 flex-col border-r border-slate-200 bg-white">
       <div className="border-b border-slate-200 px-5 py-4">
@@ -191,21 +250,26 @@ function Sidebar({ onNavigate }) {
             <NavItem key={item} label={item} onClick={() => onNavigate?.(item)} />
           ))}
         </div>
-      </div>
 
-      <div className="border-t border-slate-200 px-4 py-4">
-        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+        <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
           <p className="m-0 text-sm font-semibold text-slate-900">John Freelancer</p>
-          <p className="mt-0.5 text-xs text-slate-500">Free Plan</p>
-          <p className="mt-3 text-xs text-slate-600">Usage this month: 3 / 5 quotes</p>
+          <p className="mt-0.5 text-xs text-slate-500">{planUsage.planCode} Plan</p>
+          <p className="mt-3 text-xs text-slate-600">
+            Usage this month: {planUsage.quotaUsed} / {planUsage.quotaLimit} quotes
+          </p>
           <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-200">
-            <div className="h-full w-3/5 rounded-full bg-blue-600" />
+            <div
+              className="h-full rounded-full bg-blue-600"
+              style={{ width: `${usagePercent}%` }}
+            />
           </div>
           <button
             type="button"
+            onClick={onLogout}
+            disabled={isLoggingOut}
             className="mt-3 w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700"
           >
-            Logout
+            {isLoggingOut ? "Logging out..." : "Logout"}
           </button>
         </div>
       </div>
@@ -972,7 +1036,220 @@ function TemplatePreviewModal({
   );
 }
 
+function QuotePreviewModal({
+  isOpen,
+  onClose,
+  quoteDocument,
+  onEdit,
+  onRegenerate,
+  onDownloadPdf,
+  isDownloadingPdf,
+}) {
+  if (!isOpen || !quoteDocument) {
+    return null;
+  }
+
+  const formatMoney = (value) => {
+    if (value === null || value === undefined || value === "") {
+      return "-";
+    }
+
+    if (typeof value === "number") {
+      return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: quoteDocument.currency || "USD",
+      }).format(value);
+    }
+
+    return String(value);
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] bg-slate-100">
+      <div className="mx-auto flex h-full w-full max-w-6xl flex-col p-4 sm:p-6">
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div>
+            <h2 className="m-0 text-xl font-semibold text-slate-900">PDF Preview</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Full-document preview generated from normalized quote data.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700"
+            >
+              Back to Dashboard
+            </button>
+            <button
+              type="button"
+              onClick={onEdit}
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700"
+            >
+              Edit Inputs
+            </button>
+            <button
+              type="button"
+              onClick={onRegenerate}
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700"
+            >
+              Regenerate Quote
+            </button>
+            <button
+              type="button"
+              onClick={onDownloadPdf}
+              disabled={isDownloadingPdf}
+              className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isDownloadingPdf ? "Exporting..." : "Export To PDF"}
+            </button>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+          <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-5">
+            <div>
+              <p className="m-0 text-2xl font-bold tracking-tight text-slate-900">SOFTWARE QUOTATION</p>
+              <p className="mt-1 text-sm text-slate-600">FlashQuote AI</p>
+            </div>
+            <div className="text-sm text-slate-700">
+              <p className="m-0"><span className="font-semibold">Quote #:</span> {quoteDocument.quoteNumber}</p>
+              <p className="mt-1"><span className="font-semibold">Date:</span> {quoteDocument.issuedAt}</p>
+              <p className="mt-1"><span className="font-semibold">Valid Until:</span> {quoteDocument.validUntil}</p>
+            </div>
+          </div>
+
+          <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="rounded-lg border border-slate-200 p-4">
+              <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Prepared For</p>
+              <p className="mt-2 text-base font-semibold text-slate-900">{quoteDocument.clientName}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 p-4">
+              <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Project</p>
+              <p className="mt-2 text-base font-semibold text-slate-900">{quoteDocument.projectTitle}</p>
+              <p className="mt-1 text-sm text-slate-600">Timeline: {quoteDocument.timeline}</p>
+            </div>
+          </div>
+
+          <div className="mt-5">
+            <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Scope Summary</p>
+            <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-700">{quoteDocument.scopeSummary}</p>
+          </div>
+
+          <div className="mt-5">
+            <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Scope and Deliverables</p>
+            {quoteDocument.scopeAndDeliverables.length > 0 ? (
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+                {quoteDocument.scopeAndDeliverables.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2 text-sm text-slate-500">No deliverables were provided.</p>
+            )}
+          </div>
+
+          <div className="mt-6">
+            <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Line Items</p>
+            {quoteDocument.lineItems.length > 0 ? (
+              <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
+                <table className="min-w-full border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="bg-slate-50 text-slate-600">
+                      <th className="px-3 py-2 font-medium">Description</th>
+                      <th className="px-3 py-2 font-medium">Hours</th>
+                      <th className="px-3 py-2 font-medium">Rate</th>
+                      <th className="px-3 py-2 font-medium text-right">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {quoteDocument.lineItems.map((item) => (
+                      <tr key={item.id} className="border-t border-slate-100">
+                        <td className="px-3 py-2 text-slate-700">{item.description}</td>
+                        <td className="px-3 py-2 text-slate-700">{item.quantity}</td>
+                        <td className="px-3 py-2 text-slate-700">{formatMoney(item.rate)}</td>
+                        <td className="px-3 py-2 text-right font-medium text-slate-900">
+                          {formatMoney(item.amount)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="mt-2 text-sm text-slate-500">No line items were provided by the response.</p>
+            )}
+          </div>
+
+          <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="rounded-lg border border-slate-200 p-4">
+              <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Assumptions</p>
+              {quoteDocument.assumptions.length > 0 ? (
+                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+                  {quoteDocument.assumptions.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-sm text-slate-500">No assumptions provided.</p>
+              )}
+            </div>
+            <div className="rounded-lg border border-slate-200 p-4">
+              <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Payment Milestones</p>
+              {quoteDocument.paymentMilestones.length > 0 ? (
+                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+                  {quoteDocument.paymentMilestones.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-sm text-slate-500">No milestones provided.</p>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-6 rounded-lg border border-slate-200 p-4">
+            <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Exclusions</p>
+            {quoteDocument.exclusions.length > 0 ? (
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+                {quoteDocument.exclusions.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2 text-sm text-slate-500">No exclusions were provided.</p>
+            )}
+          </div>
+
+          <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="rounded-lg border border-slate-200 p-4">
+              <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Terms</p>
+              <p className="mt-2 whitespace-pre-wrap text-sm text-slate-700">{quoteDocument.terms}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 p-4">
+              <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Summary</p>
+              <div className="mt-2 space-y-1 text-sm text-slate-700">
+                <p className="m-0">Subtotal: <span className="font-medium text-slate-900">{formatMoney(quoteDocument.subtotal)}</span></p>
+                <p className="m-0">Tax: <span className="font-medium text-slate-900">{formatMoney(quoteDocument.tax)}</span></p>
+                <p className="m-0 text-base">Total: <span className="font-semibold text-slate-900">{formatMoney(quoteDocument.total)}</span></p>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-6 rounded-lg border border-slate-200 p-4">
+            <p className="m-0 text-xs font-semibold uppercase tracking-wide text-slate-500">Next Steps</p>
+            <p className="mt-2 whitespace-pre-wrap text-sm text-slate-700">{quoteDocument.nextSteps}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Dashboard() {
+  const { getToken } = useAuth();
+  const { signOut } = useClerk();
   const navigate = useNavigate();
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
@@ -995,9 +1272,16 @@ function Dashboard() {
   const [projectType, setProjectType] = useState("");
   const [quoteSearchQuery, setQuoteSearchQuery] = useState("");
   const [aiPrompt, setAiPrompt] = useState("");
+  const [isGeneratingAiQuote, setIsGeneratingAiQuote] = useState(false);
+  const [aiGenerationError, setAiGenerationError] = useState("");
+  const [aiGenerationMessage, setAiGenerationMessage] = useState("");
+  const [isQuotePreviewOpen, setIsQuotePreviewOpen] = useState(false);
+  const [isDownloadingQuotePdf, setIsDownloadingQuotePdf] = useState(false);
+  const [generatedQuoteDocument, setGeneratedQuoteDocument] = useState(null);
   const [quotes, setQuotes] = useState(initialRecentQuotes);
   const [clients, setClients] = useState(initialClients);
   const [templates, setTemplates] = useState(templateCards);
+  const startWithAiSectionRef = useRef(null);
   const quotesSectionRef = useRef(null);
   const clientsSectionRef = useRef(null);
   const templatesSectionRef = useRef(null);
@@ -1014,6 +1298,17 @@ function Dashboard() {
   const [templateForm, setTemplateForm] = useState(initialTemplateForm);
   const [settingsForm, setSettingsForm] = useState(initialSettingsForm);
   const [settingsMessage, setSettingsMessage] = useState("");
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [planUsage, setPlanUsage] = useState(() => getStoredSubscriptionUsage());
+
+  useEffect(() => {
+    setPlanUsage(getStoredSubscriptionUsage());
+  }, []);
+
+  const planUsagePercent =
+    planUsage.quotaLimit > 0
+      ? Math.max(0, Math.min(100, (planUsage.quotaUsed / planUsage.quotaLimit) * 100))
+      : 0;
 
   const parsedSummary = [
     "Scope detected: E-commerce web app + admin panel",
@@ -1065,6 +1360,512 @@ function Dashboard() {
       "Create a quote for an e-commerce web app with admin panel, catalog, cart, checkout, and a 6-week delivery timeline. Include assumptions and payment milestones.";
     setAiPrompt(generatedPrompt);
     setIsUploadModalOpen(false);
+  };
+
+  const updatePlanUsageFromQuota = (quota) => {
+    if (!quota || typeof quota !== "object") {
+      return;
+    }
+
+    const limit = Number(quota.quota_limit);
+    const used = Number(quota.quota_used);
+    const remaining = Number(quota.quota_remaining);
+
+    if (!Number.isFinite(limit) || !Number.isFinite(used)) {
+      return;
+    }
+
+    const normalizedLimit = Math.max(0, limit);
+    const normalizedUsed = Math.max(0, used);
+    const normalizedRemaining = Number.isFinite(remaining)
+      ? Math.max(0, remaining)
+      : Math.max(normalizedLimit - normalizedUsed, 0);
+
+    const nextUsage = {
+      planCode: planUsage.planCode,
+      quotaLimit: normalizedLimit,
+      quotaUsed: normalizedUsed,
+      quotaRemaining: normalizedRemaining,
+    };
+
+    setPlanUsage(nextUsage);
+
+    try {
+      const existingRaw = localStorage.getItem(SUBSCRIPTION_STORAGE_KEY);
+      const existing = existingRaw ? JSON.parse(existingRaw) : {};
+      const merged = {
+        ...existing,
+        quota_limit: normalizedLimit,
+        quota_used: normalizedUsed,
+        quota_remaining: normalizedRemaining,
+      };
+      localStorage.setItem(SUBSCRIPTION_STORAGE_KEY, JSON.stringify(merged));
+    } catch {
+      localStorage.setItem(
+        SUBSCRIPTION_STORAGE_KEY,
+        JSON.stringify({
+          plan_code: nextUsage.planCode,
+          quota_limit: nextUsage.quotaLimit,
+          quota_used: nextUsage.quotaUsed,
+          quota_remaining: nextUsage.quotaRemaining,
+        }),
+      );
+    }
+  };
+
+  const normalizeGeneratedQuoteResponse = (data) => {
+    const fallbackQuoteDraft =
+      data?.quoteDraft ||
+      data?.quote_draft ||
+      data?.data?.quoteDraft ||
+      data?.data?.quote_draft ||
+      {};
+    const quoteDraft = data?.quote || data?.data?.quote || fallbackQuoteDraft;
+
+    const rawLineItems =
+      quoteDraft.phases ||
+      quoteDraft.lineItems ||
+      quoteDraft.line_items ||
+      quoteDraft.items ||
+      [];
+
+    const lineItems = Array.isArray(rawLineItems)
+      ? rawLineItems.map((item, index) => ({
+          id: String(item?.id || item?.phase_number || item?.name || index),
+          description:
+            item?.phase_name || item?.description || item?.name || item?.title || `Line item ${index + 1}`,
+          quantity: item?.effort_hours || item?.quantity || item?.qty || 1,
+          rate:
+            item?.rate ||
+            item?.unit_price ||
+            item?.price ||
+            (item?.subtotal && item?.effort_hours ? item.subtotal / item.effort_hours : "-"),
+          amount: item?.subtotal || item?.amount || item?.total || item?.line_total || "-",
+        }))
+      : [];
+
+    const rawAssumptions = quoteDraft.assumptions || quoteDraft.notes || [];
+    const rawMilestones =
+      quoteDraft?.payment_terms?.milestones ||
+      quoteDraft.paymentMilestones ||
+      quoteDraft.payment_milestones ||
+      quoteDraft.milestones ||
+      [];
+    const rawDeliverables = quoteDraft.scope_and_deliverables || quoteDraft.scopeAndDeliverables || [];
+    const rawExclusions = quoteDraft.exclusions || [];
+    const rawPhases = quoteDraft.phases || [];
+    const rawPhaseSchedule = quoteDraft?.timeline?.phase_schedule || [];
+
+    const assumptions = Array.isArray(rawAssumptions)
+      ? rawAssumptions.map((item) => String(item))
+      : [];
+    const scopeAndDeliverables = Array.isArray(rawDeliverables)
+      ? rawDeliverables.map((item) => String(item))
+      : [];
+    const exclusions = Array.isArray(rawExclusions)
+      ? rawExclusions.map((item) => String(item))
+      : [];
+    const paymentMilestones = Array.isArray(rawMilestones)
+      ? rawMilestones.map((item) => {
+          if (typeof item === "string") {
+            return item;
+          }
+
+          const label = item?.label || item?.name || "Milestone";
+          const percent = item?.percent ? ` (${item.percent}%)` : "";
+          const amount = item?.amount !== undefined ? ` - ${item.amount}` : "";
+          const trigger = item?.trigger ? ` - ${item.trigger}` : "";
+          return `${label}${percent}${amount}${trigger}`;
+        })
+      : [];
+    const phases = Array.isArray(rawPhases)
+      ? rawPhases.map((item, index) => ({
+          phaseNumber: item?.phase_number || item?.phaseNumber || index + 1,
+          phaseName: item?.phase_name || item?.phaseName || `Phase ${index + 1}`,
+          tasks: Array.isArray(item?.tasks) ? item.tasks.map((task) => String(task)) : [],
+          effortHours: item?.effort_hours || item?.effortHours || 0,
+          subtotal: item?.subtotal || item?.amount || 0,
+        }))
+      : [];
+    const phaseSchedule = Array.isArray(rawPhaseSchedule)
+      ? rawPhaseSchedule.map((item, index) => ({
+          phaseNumber: item?.phase_number || item?.phaseNumber || index + 1,
+          phaseName: item?.phase_name || item?.phaseName || `Phase ${index + 1}`,
+          duration: item?.duration || "-",
+        }))
+      : [];
+    const preparedBy =
+      quoteDraft.prepared_by ||
+      quoteDraft.preparedBy ||
+      data?.prepared_by ||
+      data?.preparedBy ||
+      data?.user_name ||
+      data?.userName ||
+      "John Freelancer";
+
+    const subtotal =
+      quoteDraft?.cost_summary?.subtotal ||
+      quoteDraft.subtotal ||
+      quoteDraft.sub_total ||
+      quoteDraft.amount_without_tax ||
+      null;
+    const tax = quoteDraft?.cost_summary?.tax_amount || quoteDraft.tax || quoteDraft.tax_amount || null;
+    const total =
+      quoteDraft?.cost_summary?.grand_total ||
+      quoteDraft.total ||
+      quoteDraft.total_amount ||
+      quoteDraft.amount ||
+      quoteDraft.budget ||
+      null;
+    const generatedDate = quoteDraft.generated_date || quoteDraft.generatedDate;
+    const timelineValue = quoteDraft?.timeline?.total_duration || quoteDraft.timeline || "TBD";
+
+    return {
+      quoteNumber:
+        quoteDraft.quote_id || quoteDraft.quoteNumber || quoteDraft.quote_number || `Q-${Date.now()}`,
+      issuedAt: generatedDate || new Date().toLocaleDateString(),
+      validUntil: quoteDraft.valid_until || quoteDraft.validUntil || "-",
+      clientName: quoteDraft.clientName || quoteDraft.client_name || clientName || "New Client",
+      projectTitle:
+        quoteDraft.projectTitle || quoteDraft.project_title || projectType || "New Project",
+      scopeSummary:
+        quoteDraft.executive_summary || quoteDraft.scopeSummary || quoteDraft.scope_summary || "To be defined",
+      timeline: timelineValue,
+      budget: quoteDraft.budget || total || "$1,500",
+      pricingModel:
+        quoteDraft.pricing_model ||
+        quoteDraft.pricingModel ||
+        quoteDraft?.payment_terms?.model ||
+        settingsForm.defaultPricingModel,
+      terms: quoteDraft.terms || "To be discussed",
+      currency: quoteDraft.currency || settingsForm.currency,
+      lineItems,
+      scopeAndDeliverables,
+      assumptions,
+      exclusions,
+      paymentMilestones,
+      paymentTermsModel: quoteDraft?.payment_terms?.model || quoteDraft.pricing_model || quoteDraft.pricingModel || "-",
+      phases,
+      phaseSchedule,
+      preparedBy,
+      subtotal,
+      tax,
+      total,
+      nextSteps: quoteDraft.next_steps || quoteDraft.nextSteps || "-",
+      raw: quoteDraft,
+    };
+  };
+
+  const handleGenerateQuote = async () => {
+    if (!aiPrompt.trim()) {
+      setAiGenerationError("Please describe the project before generating a quote.");
+      setAiGenerationMessage("");
+      return;
+    }
+
+    setIsGeneratingAiQuote(true);
+    setAiGenerationError("");
+    setAiGenerationMessage("");
+
+    try {
+      const token = await getToken();
+      const response = await fetch(`${apiBaseUrl}/api/quotes/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          prompt: aiPrompt,
+          context: {
+            client_name: clientName,
+            project_type: projectType,
+            currency: settingsForm.currency,
+            default_pricing_model: settingsForm.defaultPricingModel,
+          },
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to generate quote draft.");
+      }
+
+      const responseQuota = data?.quota || data?.data?.quota;
+      updatePlanUsageFromQuota(responseQuota);
+
+      const normalizedQuote = normalizeGeneratedQuoteResponse(data);
+      setGeneratedQuoteDocument(normalizedQuote);
+      setIsQuotePreviewOpen(true);
+      setAiGenerationMessage("Quote generated successfully. Review and export to PDF.");
+    } catch (error) {
+      setAiGenerationError(error.message || "Failed to generate quote draft.");
+    } finally {
+      setIsGeneratingAiQuote(false);
+    }
+  };
+
+  const handleDownloadQuotePdf = async () => {
+    if (!generatedQuoteDocument) {
+      return;
+    }
+
+    setIsDownloadingQuotePdf(true);
+
+    try {
+      const quote = generatedQuoteDocument;
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "pt",
+        format: "a4",
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const left = 48;
+      const right = 48;
+      const contentWidth = pageWidth - left - right;
+      const bottom = pageHeight - 48;
+      let y = 52;
+      const bodyFontSize = 13;
+      const bodyLineHeight = 18;
+
+      const ensureSpace = (requiredHeight = 24) => {
+        if (y + requiredHeight > bottom) {
+          pdf.addPage();
+          y = 52;
+        }
+      };
+
+      const writeSectionHeading = (text) => {
+        ensureSpace(bodyLineHeight + 4);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(bodyFontSize);
+        pdf.text(text, left, y);
+        y += bodyLineHeight;
+      };
+
+      const writeParagraph = (text) => {
+        const safeText = text || "-";
+        const lines = pdf.splitTextToSize(String(safeText), contentWidth);
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(bodyFontSize);
+
+        lines.forEach((line) => {
+          ensureSpace(bodyLineHeight);
+          pdf.text(line, left, y);
+          y += bodyLineHeight;
+        });
+
+        y += 4;
+      };
+
+      const writeLabeledValue = (label, value) => {
+        const renderedValue = value === undefined || value === null || value === "" ? "-" : String(value);
+        const labelText = `${label}: `;
+        ensureSpace(bodyLineHeight);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(bodyFontSize);
+        pdf.text(labelText, left, y);
+        const labelWidth = pdf.getTextWidth(labelText);
+        pdf.setFont("helvetica", "normal");
+        const lines = pdf.splitTextToSize(renderedValue, contentWidth - labelWidth);
+        if (lines.length > 0) {
+          pdf.text(lines[0], left + labelWidth, y);
+        }
+        y += bodyLineHeight;
+
+        if (lines.length > 1) {
+          lines.slice(1).forEach((line) => {
+            ensureSpace(bodyLineHeight);
+            pdf.text(line, left, y);
+            y += bodyLineHeight;
+          });
+        }
+      };
+
+      const writeList = (items, prefix = "- ") => {
+        const normalizedItems = Array.isArray(items) && items.length > 0 ? items : ["-"];
+
+        normalizedItems.forEach((item) => {
+          const lines = pdf.splitTextToSize(`${prefix}${String(item)}`, contentWidth);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(bodyFontSize);
+          lines.forEach((line) => {
+            ensureSpace(bodyLineHeight);
+            pdf.text(line, left, y);
+            y += bodyLineHeight;
+          });
+        });
+
+        y += 4;
+      };
+
+      const formatAmount = (value) => {
+        const numericValue = Number(value);
+        if (!Number.isFinite(numericValue)) {
+          return "-";
+        }
+
+        const currencyCode = String(quote.currency || "USD").toUpperCase();
+        try {
+          return new Intl.NumberFormat("en-US", {
+            style: "currency",
+            currency: currencyCode,
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 2,
+          }).format(numericValue);
+        } catch (_error) {
+          return `${currencyCode} ${numericValue.toLocaleString("en-US", {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 2,
+          })}`;
+        }
+      };
+
+      const drawTable = (headers, rows, columnWidths) => {
+        const startX = left;
+        const defaultRowHeight = bodyLineHeight + 4;
+        const cellPadding = 4;
+
+        const drawRow = (cells, isHeader = false) => {
+          const wrappedCells = cells.map((cell, index) => {
+            const safeCell = cell === undefined || cell === null || cell === "" ? "-" : String(cell);
+            return pdf.splitTextToSize(safeCell, columnWidths[index] - cellPadding * 2);
+          });
+
+          const rowHeight = Math.max(
+            defaultRowHeight,
+            ...wrappedCells.map((lines) => lines.length * bodyLineHeight + 6),
+          );
+
+          ensureSpace(rowHeight + 2);
+
+          let x = startX;
+          wrappedCells.forEach((lines, index) => {
+            const cellWidth = columnWidths[index];
+            pdf.setLineWidth(1);
+            pdf.rect(x, y, cellWidth, rowHeight);
+            pdf.setFont("helvetica", isHeader ? "bold" : "normal");
+            pdf.setFontSize(bodyFontSize);
+            lines.forEach((line, lineIndex) => {
+              const textY = y + bodyLineHeight - 5 + lineIndex * bodyLineHeight;
+              pdf.text(line, x + cellPadding, textY);
+            });
+            x += cellWidth;
+          });
+
+          y += rowHeight;
+        };
+
+        drawRow(headers, true);
+        rows.forEach((row) => drawRow(row, false));
+        y += 8;
+      };
+
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(17);
+      const projectTitle = quote.projectTitle || "Project Quotation";
+      const titleLines = pdf.splitTextToSize(projectTitle, contentWidth);
+      titleLines.forEach((line) => {
+        ensureSpace(bodyLineHeight + 2);
+        pdf.text(line, left, y);
+        y += bodyLineHeight;
+      });
+      y += 4;
+
+      writeLabeledValue("Prepared For", quote.clientName);
+      writeLabeledValue("Prepared By", quote.preparedBy);
+      writeLabeledValue("Date", new Date().toLocaleDateString());
+
+      writeSectionHeading("Executive Summary");
+      writeParagraph(quote.scopeSummary);
+
+      writeLabeledValue(
+        "Development Total",
+        `${quote.timeline || "-"} | ${formatAmount(quote.total)}`,
+      );
+
+      writeSectionHeading("Scope and Deliverables");
+      writeList(quote.scopeAndDeliverables);
+
+      writeSectionHeading("Phase-Wise Breakdown and Costs");
+      const phases = Array.isArray(quote.phases) && quote.phases.length > 0
+        ? quote.phases
+        : [];
+      const totalHours = phases.reduce((sum, phase) => sum + (Number(phase?.effortHours) || 0), 0);
+      const totalAmount = phases.reduce((sum, phase) => sum + (Number(phase?.subtotal) || 0), 0);
+      const phaseRows = phases.map((phase) => [
+        String(phase.phaseNumber || "-"),
+        phase.phaseName || "-",
+        Array.isArray(phase.tasks) && phase.tasks.length > 0 ? phase.tasks.join(", ") : "-",
+        String(phase.effortHours ?? "-"),
+        formatAmount(phase.subtotal),
+      ]);
+      phaseRows.push(["", "Total", "", String(totalHours), formatAmount(totalAmount)]);
+      drawTable(
+        ["Phase Number", "Phase Name", "Tasks", "Hours", "Subtotal"],
+        phaseRows,
+        [70, 115, 160, 65, 78],
+      );
+
+      writeSectionHeading("Timeline");
+      const phaseSchedule = Array.isArray(quote.phaseSchedule) && quote.phaseSchedule.length > 0
+        ? quote.phaseSchedule
+        : [];
+      const timelineRows = phaseSchedule.map((item) => [
+        String(item.phaseNumber || "-"),
+        item.phaseName || "-",
+        item.duration || "-",
+      ]);
+      drawTable(["Phase Number", "Phase Name", "Duration"], timelineRows, [120, 220, 143]);
+
+      writeSectionHeading("Payment Terms");
+      writeLabeledValue("Model", quote.paymentTermsModel || quote.pricingModel || "-");
+      writeList(quote.paymentMilestones);
+
+      writeSectionHeading("Assumptions");
+      writeList(quote.assumptions);
+
+      writeSectionHeading("Exclusions");
+      writeList(quote.exclusions);
+
+      writeSectionHeading("Next Steps");
+      writeParagraph(quote.nextSteps);
+
+      const fileNameBase = String(quote.quoteNumber || "quote")
+        .trim()
+        .replace(/[^a-zA-Z0-9-_]+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "") || "quote";
+      pdf.save(`${fileNameBase}.pdf`);
+      setAiGenerationMessage("PDF downloaded successfully.");
+    } catch (error) {
+      setAiGenerationError(error.message || "Failed to export quote PDF.");
+    } finally {
+      setIsDownloadingQuotePdf(false);
+    }
+  };
+
+  const handleEditGeneratedQuote = () => {
+    if (!generatedQuoteDocument) {
+      return;
+    }
+
+    setCreateForm({
+      clientName: generatedQuoteDocument.clientName,
+      projectTitle: generatedQuoteDocument.projectTitle,
+      scopeSummary: generatedQuoteDocument.scopeSummary,
+      timeline: generatedQuoteDocument.timeline,
+      budget: generatedQuoteDocument.budget,
+      pricingModel: generatedQuoteDocument.pricingModel,
+      terms: generatedQuoteDocument.terms,
+    });
+    setIsQuotePreviewOpen(false);
+    setIsCreateModalOpen(true);
+    setCreateStep(1);
+    setCreateSuccessMessage("");
   };
 
   const openUploadModal = () => {
@@ -1270,7 +2071,6 @@ function Dashboard() {
       id: draftId,
       client: createForm.clientName || "New Client",
       amount: draftAmount,
-      status: "Draft",
       updated: "Just now",
     };
 
@@ -1283,7 +2083,15 @@ function Dashboard() {
     setIsCreateModalOpen(false);
     setCreateStep(1);
     setCreateForm(buildInitialCreateForm(settingsForm.defaultPricingModel));
-    setCreateSuccessMessage("Draft quote created and added to Recent Quotes.");
+    setCreateSuccessMessage("Quote created and added to Recent Quotes.");
+
+    // After closing the wizard, guide users to the AI generation block.
+    setTimeout(() => {
+      startWithAiSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 0);
   };
 
   const handleSaveSettings = () => {
@@ -1310,6 +2118,25 @@ function Dashboard() {
     }
 
     setSettingsMessage("Test notification email sent.");
+  };
+
+  const handleLogout = async () => {
+    if (isLoggingOut) {
+      return;
+    }
+
+    setIsLoggingOut(true);
+
+    try {
+      localStorage.removeItem("session_id");
+      localStorage.removeItem("session_token");
+      await signOut();
+      navigate("/", { replace: true });
+    } catch (error) {
+      setSettingsMessage("Logout failed. Please try again.");
+    } finally {
+      setIsLoggingOut(false);
+    }
   };
 
   const briefChip =
@@ -1345,7 +2172,6 @@ function Dashboard() {
           quote.id,
           quote.client,
           quote.amount,
-          quote.status,
           quote.updated,
         ]
           .join(" ")
@@ -1354,12 +2180,18 @@ function Dashboard() {
         return searchableText.includes(normalizedQuoteSearch);
       })
     : quotes;
+  const myQuotes = quotes.slice(0, 5);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <div className="flex min-h-screen">
         <div className="hidden md:block">
-          <Sidebar onNavigate={handleSidebarNavigate} />
+          <Sidebar
+            onNavigate={handleSidebarNavigate}
+            onLogout={handleLogout}
+            isLoggingOut={isLoggingOut}
+            planUsage={planUsage}
+          />
         </div>
 
         {isMobileSidebarOpen ? (
@@ -1371,7 +2203,12 @@ function Dashboard() {
               aria-label="Close sidebar"
             />
             <div className="relative z-50 h-full w-72">
-              <Sidebar onNavigate={handleSidebarNavigate} />
+              <Sidebar
+                onNavigate={handleSidebarNavigate}
+                onLogout={handleLogout}
+                isLoggingOut={isLoggingOut}
+                planUsage={planUsage}
+              />
             </div>
           </div>
         ) : null}
@@ -1440,7 +2277,7 @@ function Dashboard() {
               ))}
             </section>
 
-            <section className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+            <section ref={startWithAiSectionRef} className="grid grid-cols-1 gap-6 xl:grid-cols-3">
               <article className="rounded-2xl border border-slate-200 bg-white p-5 xl:col-span-2">
                 <h2 className="m-0 text-lg font-semibold text-slate-900">
                   Start with AI
@@ -1452,15 +2289,26 @@ function Dashboard() {
                   rows={5}
                   placeholder="Example: Build an e-commerce web app with admin panel, payment integration, and 6-week timeline..."
                   value={aiPrompt}
-                  onChange={(event) => setAiPrompt(event.target.value)}
+                  onChange={(event) => {
+                    setAiPrompt(event.target.value);
+                    if (aiGenerationError) {
+                      setAiGenerationError("");
+                    }
+                    if (aiGenerationMessage) {
+                      setAiGenerationMessage("");
+                    }
+                  }}
+                  disabled={isGeneratingAiQuote}
                   className="mt-4 w-full resize-y rounded-xl border border-slate-300 bg-white p-3 text-sm outline-none placeholder:text-slate-400 focus:border-blue-400"
                 />
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     type="button"
+                    onClick={handleGenerateQuote}
+                    disabled={isGeneratingAiQuote}
                     className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white"
                   >
-                    Generate Quote
+                    {isGeneratingAiQuote ? "Generating..." : "Generate Quote"}
                   </button>
                   <button
                     type="button"
@@ -1470,16 +2318,28 @@ function Dashboard() {
                     Use Template
                   </button>
                 </div>
+                {aiGenerationError ? (
+                  <p className="mt-3 text-sm font-medium text-red-600">{aiGenerationError}</p>
+                ) : null}
+                {aiGenerationMessage ? (
+                  <p className="mt-3 text-sm font-medium text-green-700">{aiGenerationMessage}</p>
+                ) : null}
               </article>
 
               <article className="rounded-2xl border border-slate-200 bg-white p-5">
                 <h2 className="m-0 text-lg font-semibold text-slate-900">Plan Usage</h2>
                 <p className="mt-1 text-sm text-slate-600">
-                  Free plan: 3 of 5 monthly quotes used.
+                  {planUsage.planCode} plan: {planUsage.quotaUsed} of {planUsage.quotaLimit} monthly quotes used.
                 </p>
                 <div className="mt-4 h-2 w-full overflow-hidden rounded-full bg-slate-200">
-                  <div className="h-full w-3/5 rounded-full bg-blue-600" />
+                  <div
+                    className="h-full rounded-full bg-blue-600"
+                    style={{ width: `${planUsagePercent}%` }}
+                  />
                 </div>
+                <p className="mt-2 text-xs text-slate-500">
+                  Remaining this period: {planUsage.quotaRemaining}
+                </p>
                 <button
                   type="button"
                   onClick={openUpgradeModal}
@@ -1496,6 +2356,44 @@ function Dashboard() {
                   <li>1 quote expires in 24 hours</li>
                 </ul>
               </article>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="m-0 text-lg font-semibold text-slate-900">My Quotes</h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Quick previews of your latest generated quotes.
+                  </p>
+                </div>
+                <p className="m-0 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  Showing up to 5
+                </p>
+              </div>
+
+              {myQuotes.length > 0 ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  {myQuotes.map((quote) => (
+                    <article
+                      key={`my-${quote.id}`}
+                      className="rounded-xl border border-slate-200 bg-slate-50 p-3"
+                    >
+                      <p className="m-0 text-sm font-semibold text-slate-900">{quote.id}</p>
+                      <p className="m-0 truncate text-sm text-slate-700">{quote.client}</p>
+                      <p className="mt-1 text-base font-semibold text-slate-900">{quote.amount}</p>
+                      <p className="mt-1 text-xs text-slate-500">Updated {quote.updated}</p>
+                      <button
+                        type="button"
+                        className="mt-3 w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700"
+                      >
+                        View Quote
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">No quotes yet. Create one to see previews here.</p>
+              )}
             </section>
 
             <section
@@ -1529,7 +2427,6 @@ function Dashboard() {
                         <th className="py-2 pr-3 font-medium">Quote ID</th>
                         <th className="py-2 pr-3 font-medium">Client</th>
                         <th className="py-2 pr-3 font-medium">Amount</th>
-                        <th className="py-2 pr-3 font-medium">Status</th>
                         <th className="py-2 pr-3 font-medium">Updated</th>
                         <th className="py-2 font-medium">Action</th>
                       </tr>
@@ -1540,7 +2437,6 @@ function Dashboard() {
                           <td className="py-3 pr-3 font-medium text-slate-800">{quote.id}</td>
                           <td className="py-3 pr-3 text-slate-700">{quote.client}</td>
                           <td className="py-3 pr-3 text-slate-700">{quote.amount}</td>
-                          <td className="py-3 pr-3 text-slate-700">{quote.status}</td>
                           <td className="py-3 pr-3 text-slate-700">{quote.updated}</td>
                           <td className="py-3">
                             <button
@@ -1568,7 +2464,6 @@ function Dashboard() {
                       <p className="m-0 text-sm font-semibold text-slate-900">{quote.id}</p>
                       <p className="mt-1 text-sm text-slate-700">{quote.client}</p>
                       <p className="mt-1 text-sm text-slate-600">{quote.amount}</p>
-                      <p className="mt-1 text-sm text-slate-600">{quote.status}</p>
                       <p className="mt-1 text-xs text-slate-500">Updated {quote.updated}</p>
                     </article>
                   ))
@@ -1957,6 +2852,16 @@ function Dashboard() {
         onClose={closeTemplatePreview}
         template={previewTemplate}
         onUseTemplate={handleUseTemplate}
+      />
+
+      <QuotePreviewModal
+        isOpen={isQuotePreviewOpen}
+        onClose={() => setIsQuotePreviewOpen(false)}
+        quoteDocument={generatedQuoteDocument}
+        onEdit={handleEditGeneratedQuote}
+        onRegenerate={handleGenerateQuote}
+        onDownloadPdf={handleDownloadQuotePdf}
+        isDownloadingPdf={isDownloadingQuotePdf}
       />
     </div>
   );
