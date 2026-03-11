@@ -163,14 +163,19 @@ const initialTemplateForm = {
 };
 
 const initialSettingsForm = {
-  workspaceName: "John Freelancer Workspace",
+  workspaceName: "",
   notificationEmails: true,
   timezone: "UTC",
   defaultPricingModel: "Fixed",
   currency: "USD",
   defaultQuoteValidityDays: "14",
-  autoSaveDrafts: true,
 };
+
+const currencySymbols = { USD: "$", EUR: "€", INR: "₹", GBP: "£" };
+
+function getCurrencySymbol(currency) {
+  return currencySymbols[currency] || currency;
+}
 
 function buildInitialCreateForm(defaultPricingModel = "Fixed") {
   return {
@@ -444,6 +449,7 @@ function CreateQuoteModal({
   setStep,
   onCreateDraft,
   isCreating,
+  currencySymbol = "$",
 }) {
   if (!isOpen) {
     return null;
@@ -560,7 +566,7 @@ function CreateQuoteModal({
                     setForm((previous) => ({ ...previous, budget: event.target.value }))
                   }
                   className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-400"
-                  placeholder="$3,000"
+                  placeholder={`${currencySymbol}3,000`}
                 />
               </div>
             </div>
@@ -1305,8 +1311,41 @@ function Dashboard() {
   const [templateForm, setTemplateForm] = useState(initialTemplateForm);
   const [settingsForm, setSettingsForm] = useState(initialSettingsForm);
   const [settingsMessage, setSettingsMessage] = useState("");
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [planUsage, setPlanUsage] = useState(() => getStoredSubscriptionUsage());
+
+  const defaultWorkspaceName = user?.firstName
+    ? `${user.firstName}'s Workspace`
+    : "My Workspace";
+
+  const fetchSettings = async () => {
+    try {
+      const token = await getToken();
+      const response = await fetch(`${apiBaseUrl}/api/settings`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        return;
+      }
+      const s = data?.settings || data?.data || data || {};
+      setSettingsForm({
+        workspaceName: s.workspace_name || s.workspaceName || defaultWorkspaceName,
+        notificationEmails: s.notification_emails ?? s.notificationEmails ?? true,
+        timezone: s.timezone || "UTC",
+        defaultPricingModel: s.default_pricing_model || s.defaultPricingModel || "Fixed",
+        currency: s.currency || "USD",
+        defaultQuoteValidityDays: String(s.default_quote_validity_days ?? s.defaultQuoteValidityDays ?? "14"),
+      });
+    } catch {
+      // Silently fall back to local defaults
+    }
+  };
 
   const fetchQuotes = async () => {
     setIsLoadingQuotes(true);
@@ -1423,8 +1462,18 @@ function Dashboard() {
     setPlanUsage(getStoredSubscriptionUsage());
     fetchQuotes();
     fetchTemplates();
+    fetchSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (defaultWorkspaceName && !settingsForm.workspaceName) {
+      setSettingsForm((previous) => ({
+        ...previous,
+        workspaceName: defaultWorkspaceName,
+      }));
+    }
+  }, [defaultWorkspaceName]);
 
   const planUsagePercent =
     planUsage.quotaLimit > 0
@@ -2024,7 +2073,11 @@ function Dashboard() {
 
   const handleUseTemplate = (template) => {
     setIsTemplatePreviewOpen(false);
-    setCreateForm(template.preset);
+    const symbol = getCurrencySymbol(settingsForm.currency);
+    const convertedBudget = template.preset.budget
+      ? template.preset.budget.replace(/^\$/, symbol)
+      : template.preset.budget;
+    setCreateForm({ ...template.preset, budget: convertedBudget });
     setIsCreateModalOpen(true);
     setCreateStep(1);
     setCreateSuccessMessage("");
@@ -2225,21 +2278,45 @@ function Dashboard() {
     }, 0);
   };
 
-  const handleSaveSettings = () => {
-    setSettingsMessage("Settings saved successfully.");
+  const handleSaveSettings = async () => {
+    setIsSavingSettings(true);
+    setSettingsMessage("");
+    try {
+      const token = await getToken();
+      const response = await fetch(`${apiBaseUrl}/api/settings`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          workspace_name: settingsForm.workspaceName,
+          notification_emails: settingsForm.notificationEmails,
+          timezone: settingsForm.timezone,
+          default_pricing_model: settingsForm.defaultPricingModel,
+          currency: settingsForm.currency,
+          default_quote_validity_days: Number(settingsForm.defaultQuoteValidityDays) || 14,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to save settings.");
+      }
+      setCreateForm((previous) => ({
+        ...previous,
+        pricingModel: settingsForm.defaultPricingModel,
+      }));
+      setSettingsMessage("Settings saved successfully.");
+    } catch (error) {
+      setSettingsMessage(error.message || "Failed to save settings.");
+    } finally {
+      setIsSavingSettings(false);
+    }
   };
 
   const handleResetSettings = () => {
-    setSettingsForm(initialSettingsForm);
+    setSettingsForm({ ...initialSettingsForm, workspaceName: defaultWorkspaceName });
     setSettingsMessage("Settings reset to defaults.");
-  };
-
-  const handleApplyQuoteDefaults = () => {
-    setCreateForm((previous) => ({
-      ...previous,
-      pricingModel: settingsForm.defaultPricingModel,
-    }));
-    setSettingsMessage("Quote defaults applied to the draft form.");
   };
 
   const handleSendTestEmail = () => {
@@ -2890,34 +2967,17 @@ function Dashboard() {
                   />
                 </article>
 
-                <article className="rounded-xl border border-slate-200 p-4">
-                  <label className="mb-2 block text-sm text-slate-500">Auto-save Drafts</label>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettingsForm((previous) => ({
-                        ...previous,
-                        autoSaveDrafts: !previous.autoSaveDrafts,
-                      }))
-                    }
-                    className={`rounded-lg border px-3 py-2 text-sm font-medium ${
-                      settingsForm.autoSaveDrafts
-                        ? "border-green-200 bg-green-50 text-green-700"
-                        : "border-slate-300 bg-white text-slate-700"
-                    }`}
-                  >
-                    {settingsForm.autoSaveDrafts ? "Enabled" : "Disabled"}
-                  </button>
-                </article>
+
               </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={handleSaveSettings}
-                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white"
+                  disabled={isSavingSettings}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Save Changes
+                  {isSavingSettings ? "Saving..." : "Save Changes"}
                 </button>
                 <button
                   type="button"
@@ -2925,13 +2985,6 @@ function Dashboard() {
                   className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700"
                 >
                   Reset
-                </button>
-                <button
-                  type="button"
-                  onClick={handleApplyQuoteDefaults}
-                  className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700"
-                >
-                  Apply to Quote Form
                 </button>
                 <button
                   type="button"
@@ -3006,6 +3059,7 @@ function Dashboard() {
         setStep={setCreateStep}
         onCreateDraft={handleCreateDraft}
         isCreating={isCreatingQuote}
+        currencySymbol={getCurrencySymbol(settingsForm.currency)}
       />
 
       <AddClientModal
