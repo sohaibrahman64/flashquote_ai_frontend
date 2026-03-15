@@ -26,6 +26,8 @@ import {
 } from "react-router-dom";
 import { BASE_URL } from "./Constants";
 import Dashboard from "./Dashboard";
+import PrivacyPolicy from "./PrivacyPolicy";
+import TermsAndConditions from "./TermsAndConditions";
 
 const stripePublishableKey = (
   process.env.REACT_APP_STRIPE_PUBLISHABLE_KEY ||
@@ -298,6 +300,19 @@ function AuthCallbackPage() {
 }
 
 function PageLayout({ children }) {
+  // Smooth scroll handler for navigation links
+  const handleSmoothScroll = (event) => {
+    const href = event.currentTarget.getAttribute("href");
+    if (href && href.startsWith("/#")) {
+      const id = href.replace("/#", "");
+      const section = document.getElementById(id);
+      if (section) {
+        event.preventDefault();
+        section.scrollIntoView({ behavior: "smooth" });
+      }
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-blue-50 via-white to-white text-gray-900">
       <header className="border-b border-slate-100 px-6 py-5">
@@ -315,18 +330,21 @@ function PageLayout({ children }) {
             <a
               href="/#about-us"
               className="text-sm font-medium text-gray-700 no-underline hover:text-blue-700"
+              onClick={handleSmoothScroll}
             >
               About Us
             </a>
             <a
               href="/#how-it-works"
               className="text-sm font-medium text-gray-700 no-underline hover:text-blue-700"
+              onClick={handleSmoothScroll}
             >
               How It Works
             </a>
             <a
               href="/#pricing"
               className="text-sm font-medium text-gray-700 no-underline hover:text-blue-700"
+              onClick={handleSmoothScroll}
             >
               Pricing
             </a>
@@ -357,10 +375,23 @@ function PageLayout({ children }) {
       {children}
 
       <footer className="border-t border-slate-100 px-6 py-8">
-        <div className="mx-auto grid max-w-6xl gap-2 text-sm text-gray-600 md:grid-cols-3 md:items-center">
-          <p className="m-0 font-semibold text-gray-800">FlashQuote AI</p>
-          <p className="m-0 md:text-center">Owner Email: owner@flashquote.ai</p>
-          <p className="m-0 md:text-right">Mobile: +91 98765 43210</p>
+        <div className="mx-auto max-w-6xl grid gap-4 text-sm text-gray-600 md:grid-cols-3 md:items-center">
+          {/* Left: Copyright Notice */}
+          <div className="flex flex-col md:items-start gap-2">
+            <span className="font-semibold text-gray-800">© 2026 FlashQuote AI. All rights reserved.</span>
+          </div>
+          {/* Center: Owner Info */}
+          <div className="flex flex-col items-center gap-2">
+            <span>Owner: Sohaib Rahman</span>
+            <span>Email: flashquoteai@gmail.com</span>
+            <span>Mobile: +91 7030228602</span>
+          </div>
+          {/* Right: Legal and Version Info */}
+          <div className="flex flex-col items-end gap-2">
+            <Link to="/privacy-policy" className="hover:text-blue-600">Privacy Policy</Link>
+            <Link to="/terms-and-conditions" className="hover:text-blue-600">Terms and Conditions</Link>
+            <span className="text-xs text-gray-400 mt-2">Version: 1.0.0</span>
+          </div>
         </div>
       </footer>
     </div>
@@ -530,7 +561,7 @@ function HomePage() {
                 <li>Core AI estimate suggestions</li>
                 <li>Standard quotation template</li>
                 <li>Export to PDF</li>
-                <li>Community email support</li>
+                
               </ul>
               <Link
                 to="/checkout?plan=Free"
@@ -552,12 +583,13 @@ function HomePage() {
                 <li>Export to PDF and DOC</li>
                 <li>Email support</li>
               </ul>
-              <Link
-                to="/checkout?plan=Starter"
-                className="mt-6 block w-full rounded-lg bg-blue-600 px-4 py-2 text-center text-sm font-semibold text-white no-underline"
+              <button
+                type="button"
+                disabled
+                className="mt-6 block w-full rounded-lg bg-gray-300 px-4 py-2 text-center text-sm font-semibold text-gray-500 cursor-not-allowed"
               >
-                Subscribe to Starter
-              </Link>
+                Coming Soon
+              </button>
             </article>
 
             <article className="rounded-2xl border-2 border-blue-600 bg-blue-50 p-6">
@@ -576,12 +608,13 @@ function HomePage() {
                 <li>Download PDF and DOC formats</li>
                 <li>Priority email support</li>
               </ul>
-              <Link
-                to="/checkout?plan=Professional"
-                className="mt-6 block w-full rounded-lg bg-blue-700 px-4 py-2 text-center text-sm font-semibold text-white no-underline"
+              <button
+                type="button"
+                disabled
+                className="mt-6 block w-full rounded-lg bg-gray-300 px-4 py-2 text-center text-sm font-semibold text-gray-500 cursor-not-allowed"
               >
-                Subscribe to Professional
-              </Link>
+                Coming Soon
+              </button>
             </article>
 
             <article className="rounded-2xl border border-gray-200 bg-white p-6">
@@ -597,12 +630,13 @@ function HomePage() {
                 <li>API access for CRM integrations</li>
                 <li>Dedicated support channel</li>
               </ul>
-              <Link
-                to="/checkout?plan=Agency%20Plus"
-                className="mt-6 block w-full rounded-lg bg-gray-900 px-4 py-2 text-center text-sm font-semibold text-white no-underline"
+              <button
+                type="button"
+                disabled
+                className="mt-6 block w-full rounded-lg bg-gray-300 px-4 py-2 text-center text-sm font-semibold text-gray-500 cursor-not-allowed"
               >
-                Subscribe to Agency Plus
-              </Link>
+                Coming Soon
+              </button>
             </article>
           </div>
         </section>
@@ -830,6 +864,8 @@ function App() {
       <Route path="/activate-free" element={<ActivateFreePage />} />
       <Route path="/pricing" element={<Navigate to="/#pricing" replace />} />
       <Route path="/checkout" element={<CheckoutPage />} />
+      <Route path="/privacy-policy" element={<PageLayout><PrivacyPolicy /></PageLayout>} />
+      <Route path="/terms-and-conditions" element={<PageLayout><TermsAndConditions /></PageLayout>} />
       <Route
         path="/sign-in/*"
         element={

@@ -57,12 +57,43 @@ function getStoredSubscriptionUsage() {
   }
 }
 
-const kpiCards = [
-  { label: "Quotes this month", value: "12" },
-  { label: "Acceptance rate", value: "67%" },
-  { label: "Avg quote value", value: "$2,450" },
-  { label: "Pending follow-ups", value: "4" },
-];
+// KPIs: Quotes This Month, Total Lifetime Quotes, Total Quote Value ($), Quote Value This Month ($)
+function getKpiCards(quotes, currencySymbol = "$") {
+  // Get current month/year
+  const now = new Date();
+  const currentMonth = now.getMonth();
+  const currentYear = now.getFullYear();
+
+  // Quotes this month
+  const quotesThisMonth = quotes.filter((q) => {
+    if (!q.updated) return false;
+    const date = new Date(q.updated);
+    return date.getMonth() === currentMonth && date.getFullYear() === currentYear;
+  });
+
+  // Total Lifetime Quotes
+  const totalLifetimeQuotes = quotes.length;
+
+  // Total Quote Value ($)
+  const totalQuoteValue = quotes.reduce((sum, q) => {
+    // Remove currency symbol and commas
+    const val = typeof q.amount === "string" ? q.amount.replace(/[^\d.]/g, "") : q.amount;
+    return sum + (parseFloat(val) || 0);
+  }, 0);
+
+  // Quote Value This Month ($)
+  const quoteValueThisMonth = quotesThisMonth.reduce((sum, q) => {
+    const val = typeof q.amount === "string" ? q.amount.replace(/[^\d.]/g, "") : q.amount;
+    return sum + (parseFloat(val) || 0);
+  }, 0);
+
+  return [
+    { label: "Quotes This Month", value: quotesThisMonth.length },
+    { label: "Total Lifetime Quotes", value: totalLifetimeQuotes },
+    { label: `Total Quote Value (${currencySymbol})`, value: `${currencySymbol}${totalQuoteValue.toLocaleString()}` },
+    { label: `Quote Value This Month (${currencySymbol})`, value: `${currencySymbol}${quoteValueThisMonth.toLocaleString()}` },
+  ];
+}
 
 const initialRecentQuotes = [
   {
@@ -301,8 +332,39 @@ function UploadBriefModal({
   setProjectType,
   parsedSummary,
 }) {
+
   if (!isOpen) {
     return null;
+  }
+  // If user is on FREE plan, show upgrade message instead of modal content
+  if (typeof window !== "undefined") {
+    const planCode = (window.localStorage.getItem("subscription_snapshot") && JSON.parse(window.localStorage.getItem("subscription_snapshot")).plan_code) || "FREE";
+    if (planCode.toUpperCase() === "FREE") {
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="m-0 text-xl font-semibold text-slate-900">Upload Brief</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  This feature is available on paid plans only.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700"
+              >
+                Close
+              </button>
+            </div>
+            <div className="py-8 text-center text-slate-600">
+              <p className="text-lg font-semibold">Upgrade your plan to use Upload Brief and auto-extract requirements from files.</p>
+            </div>
+          </div>
+        </div>
+      );
+    }
   }
 
   return (
@@ -1785,7 +1847,12 @@ function Dashboard() {
     setIsDownloadingQuotePdf(true);
 
     try {
+
       const quote = generatedQuoteDocument;
+      // Get user name for Prepared By
+      const preparedByName = user?.firstName || user?.username || user?.email || "-";
+      // Get validity days from settings or fallback
+      const validityDays = settingsForm?.defaultQuoteValidityDays || initialSettingsForm.defaultQuoteValidityDays || "14";
       const pdf = new jsPDF({
         orientation: "portrait",
         unit: "pt",
@@ -1802,6 +1869,15 @@ function Dashboard() {
       const bodyFontSize = 13;
       const bodyLineHeight = 18;
 
+      // Draw a horizontal line in grey
+      const drawGreyLine = () => {
+        const lineY = y;
+        pdf.setDrawColor(180, 180, 180);
+        pdf.setLineWidth(1);
+        pdf.line(left, lineY, pageWidth - right, lineY);
+        y += 8; // space after line
+      };
+
       const ensureSpace = (requiredHeight = 24) => {
         if (y + requiredHeight > bottom) {
           pdf.addPage();
@@ -1809,7 +1885,11 @@ function Dashboard() {
         }
       };
 
+      // Write a section heading with spacing and a grey line before
       const writeSectionHeading = (text) => {
+        y += 8; // new line before
+        drawGreyLine();
+        y += 8; // new line after line
         ensureSpace(bodyLineHeight + 4);
         pdf.setFont("helvetica", "bold");
         pdf.setFontSize(bodyFontSize);
@@ -1817,18 +1897,17 @@ function Dashboard() {
         y += bodyLineHeight;
       };
 
+      // Write a paragraph with normal font
       const writeParagraph = (text) => {
         const safeText = text || "-";
         const lines = pdf.splitTextToSize(String(safeText), contentWidth);
         pdf.setFont("helvetica", "normal");
         pdf.setFontSize(bodyFontSize);
-
         lines.forEach((line) => {
           ensureSpace(bodyLineHeight);
           pdf.text(line, left, y);
           y += bodyLineHeight;
         });
-
         y += 4;
       };
 
@@ -1873,25 +1952,32 @@ function Dashboard() {
         y += 4;
       };
 
+      // Use locale-specific formatting for INR to ensure ₹ is rendered correctly
       const formatAmount = (value) => {
         const numericValue = Number(value);
         if (!Number.isFinite(numericValue)) {
           return "-";
         }
-
-        const currencyCode = String(quote.currency || "USD").toUpperCase();
+        const currencyCode = String(quote.currency || settingsForm?.currency || initialSettingsForm.currency || "USD").toUpperCase();
+        let locale = "en-US";
         try {
-          return new Intl.NumberFormat("en-US", {
+          let formatted = new Intl.NumberFormat(locale, {
             style: "currency",
             currency: currencyCode,
             minimumFractionDigits: 0,
             maximumFractionDigits: 2,
           }).format(numericValue);
+          // Replace ₹ with Rs. for INR in PDF only
+          if (currencyCode === "INR") {
+            // Remove the ₹ symbol and replace with Rs. and a space
+            formatted = formatted.replace(/\u20B9|₹/g, "Rs. ");
+          }
+          return formatted;
         } catch (_error) {
-          return `${currencyCode} ${numericValue.toLocaleString("en-US", {
-            minimumFractionDigits: 0,
-            maximumFractionDigits: 2,
-          })}`;
+          if (currencyCode === "INR") {
+            return `Rs. ${numericValue.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+          }
+          return `${currencyCode} ${numericValue.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
         }
       };
 
@@ -1935,32 +2021,63 @@ function Dashboard() {
         y += 8;
       };
 
+
+      // Centered heading
       pdf.setFont("helvetica", "bold");
-      pdf.setFontSize(17);
-      const projectTitle = quote.projectTitle || "Project Quotation";
-      const titleLines = pdf.splitTextToSize(projectTitle, contentWidth);
-      titleLines.forEach((line) => {
+      pdf.setFontSize(20);
+      const heading = quote.projectTitle || "Project Quotation";
+      const headingLines = pdf.splitTextToSize(heading, contentWidth);
+      headingLines.forEach((line) => {
         ensureSpace(bodyLineHeight + 2);
-        pdf.text(line, left, y);
+        pdf.text(line, pageWidth / 2, y, { align: "center" });
         y += bodyLineHeight;
       });
-      y += 4;
+      y += 8; // new line after heading
 
+      // Prepared For, By (user), Date
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(bodyFontSize);
       writeLabeledValue("Prepared For", quote.clientName);
-      writeLabeledValue("Prepared By", quote.preparedBy);
+      writeLabeledValue("Prepared By", preparedByName);
       writeLabeledValue("Date", new Date().toLocaleDateString());
+  // ...existing code for all sections...
 
-      writeSectionHeading("Executive Summary");
+  // Prepared By section at end
+  y += 8;
+  drawGreyLine();
+  y += 8;
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(bodyFontSize);
+  pdf.text("Prepared By", left, y);
+  y += bodyLineHeight;
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(bodyFontSize);
+  pdf.text(`User Name: ${preparedByName}`, left, y);
+  y += bodyLineHeight;
+  pdf.text(`Quotation Validity: ${validityDays} days from the date above.`, left, y);
+  y += bodyLineHeight;
+
+      // New line, grey line, new line before Executive Summary
+      y += 8;
+      drawGreyLine();
+      y += 8;
+
+      // Executive Summary
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(bodyFontSize);
+      pdf.text("Executive Summary", left, y);
+      y += bodyLineHeight;
       writeParagraph(quote.scopeSummary);
-
       writeLabeledValue(
         "Development Total",
         `${quote.timeline || "-"} | ${formatAmount(quote.total)}`,
       );
 
+      // Section: Scope and Deliverables
       writeSectionHeading("Scope and Deliverables");
       writeList(quote.scopeAndDeliverables);
 
+      // Section: Phase-Wise Breakdown and Costs
       writeSectionHeading("Phase-Wise Breakdown and Costs");
       const phases = Array.isArray(quote.phases) && quote.phases.length > 0
         ? quote.phases
@@ -1981,6 +2098,7 @@ function Dashboard() {
         [70, 115, 160, 65, 78],
       );
 
+      // Section: Timeline
       writeSectionHeading("Timeline");
       const phaseSchedule = Array.isArray(quote.phaseSchedule) && quote.phaseSchedule.length > 0
         ? quote.phaseSchedule
@@ -1992,16 +2110,20 @@ function Dashboard() {
       ]);
       drawTable(["Phase Number", "Phase Name", "Duration"], timelineRows, [120, 220, 143]);
 
+      // Section: Payment Terms
       writeSectionHeading("Payment Terms");
       writeLabeledValue("Model", quote.paymentTermsModel || quote.pricingModel || "-");
       writeList(quote.paymentMilestones);
 
+      // Section: Assumptions
       writeSectionHeading("Assumptions");
       writeList(quote.assumptions);
 
+      // Section: Exclusions
       writeSectionHeading("Exclusions");
       writeList(quote.exclusions);
 
+      // Section: Next Steps
       writeSectionHeading("Next Steps");
       writeParagraph(quote.nextSteps);
 
@@ -2039,6 +2161,7 @@ function Dashboard() {
     setCreateSuccessMessage("");
   };
 
+  // Always open the Upload Brief modal; gating is handled inside the modal
   const openUploadModal = () => {
     setIsUploadModalOpen(true);
     resetUploadFlow();
@@ -2470,15 +2593,12 @@ function Dashboard() {
               </div>
 
               <div className="flex items-center gap-2">
-                <span
-                  className={`hidden rounded-full border px-2.5 py-1 text-xs font-semibold sm:inline-flex ${briefChip.className}`}
-                >
-                  {briefChip.label}
-                </span>
+                {/* Hide No Brief tag */}
+                {/* <span className={`hidden rounded-full border px-2.5 py-1 text-xs font-semibold sm:inline-flex ${briefChip.className}`}>{briefChip.label}</span> */}
                 <button
                   type="button"
-                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700"
-                  onClick={openUploadModal}
+                  disabled
+                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-400 cursor-not-allowed"
                 >
                   Upload Brief
                 </button>
@@ -2501,7 +2621,7 @@ function Dashboard() {
             ) : null}
 
             <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-              {kpiCards.map((card) => (
+              {getKpiCards(quotes, getCurrencySymbol(settingsForm.currency)).map((card) => (
                 <article
                   key={card.label}
                   className="rounded-2xl border border-slate-200 bg-white p-5"
@@ -2538,13 +2658,13 @@ function Dashboard() {
                 />
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
-                    type="button"
-                    onClick={handleGenerateQuote}
-                    disabled={isGeneratingAiQuote}
-                    className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white"
-                  >
-                    {isGeneratingAiQuote ? "Generating..." : "Generate Quote"}
-                  </button>
+                      type="button"
+                      onClick={handleGenerateQuote}
+                      disabled={isGeneratingAiQuote || (planUsage && planUsage.quotaUsed >= planUsage.quotaLimit)}
+                      className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {isGeneratingAiQuote ? "Generating..." : "Generate Quote"}
+                    </button>
                   <button
                     type="button"
                     onClick={openTemplatesSection}
@@ -2577,8 +2697,8 @@ function Dashboard() {
                 </p>
                 <button
                   type="button"
-                  onClick={openUpgradeModal}
-                  className="mt-4 w-full rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700"
+                  disabled
+                  className="mt-4 w-full rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-400 cursor-not-allowed"
                 >
                   Upgrade Plan
                 </button>
@@ -2827,8 +2947,8 @@ function Dashboard() {
                 </div>
                 <button
                   type="button"
-                  onClick={openUpgradeModal}
-                  className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700"
+                  disabled
+                  className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-400 cursor-not-allowed"
                 >
                   Upgrade Plan
                 </button>
@@ -2875,25 +2995,7 @@ function Dashboard() {
                   />
                 </article>
 
-                <article className="rounded-xl border border-slate-200 p-4">
-                  <label className="mb-2 block text-sm text-slate-500">Notification Emails</label>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettingsForm((previous) => ({
-                        ...previous,
-                        notificationEmails: !previous.notificationEmails,
-                      }))
-                    }
-                    className={`rounded-lg border px-3 py-2 text-sm font-medium ${
-                      settingsForm.notificationEmails
-                        ? "border-green-200 bg-green-50 text-green-700"
-                        : "border-slate-300 bg-white text-slate-700"
-                    }`}
-                  >
-                    {settingsForm.notificationEmails ? "Enabled" : "Disabled"}
-                  </button>
-                </article>
+                {/* Notification Emails toggle hidden */}
 
                 <article className="rounded-xl border border-slate-200 p-4 md:col-span-2">
                   <label className="mb-1 block text-sm text-slate-500">Timezone</label>
@@ -2986,13 +3088,7 @@ function Dashboard() {
                 >
                   Reset
                 </button>
-                <button
-                  type="button"
-                  onClick={handleSendTestEmail}
-                  className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700"
-                >
-                  Send Test Email
-                </button>
+                {/* Send Test Email button hidden */}
                 {settingsMessage ? (
                   <p className="m-0 text-sm font-medium text-green-700">{settingsMessage}</p>
                 ) : null}
